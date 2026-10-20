@@ -262,8 +262,12 @@ def check_cross(sym, h1, st, ctx):
         return "sin cruce"
     ts = h1.index[-1]
     key = f"{dirn}|{ts}"
-    if st["last"].get(f"{sym}|1h") == key:
+    k = f"{sym}|1h"
+    prev = st["last"].get(k)
+    if prev == key:
         return f"cruce {NAME[dirn]} (ya avisado)"
+    if prev == key + "|filtrado":
+        return f"cruce {NAME[dirn]} sin confluencia (ya descartado, no se avisa)"
     why = []
     if ctx.get("ob") == dirn:
         why.append("precio en OB semanal " + NAME[dirn].lower())
@@ -272,12 +276,12 @@ def check_cross(sym, h1, st, ctx):
             pd.Timestamp.now(tz="UTC") - pd.Timestamp(div["seen"]) <= pd.Timedelta(hours=GATE_DIV_HOURS):
         why.append("divergencia RSI diaria " + NAME[dirn].lower())
     if GATE_1H and not why:
-        st["last"][f"{sym}|1h"] = key
+        st["last"][k] = key + "|filtrado"
         return f"cruce {NAME[dirn]} sin confluencia (no se avisa)"
     ok = send(f"{label(sym)} · HORARIO\nCruce {NAME[dirn]} EMA{FAST}/EMA{SLOW}\nPrecio: {c.iloc[-1]:.5g}\n"
               f"Contexto: {', '.join(why) if why else 'sin confluencia'}\nVela: {ts:%Y-%m-%d %H:%M} UTC")
     if ok:
-        st["last"][f"{sym}|1h"] = key
+        st["last"][k] = key
     return f"cruce {NAME[dirn]} (alerta {'enviada' if ok else 'FALLÓ'})"
 
 
@@ -288,10 +292,9 @@ def run_symbol(sym, st, h1, d1):
     s_ob = check_ob(sym, px, obs, st, ctx)   # fija el contexto semanal
     s_div = check_div(sym, d1, st, ctx)      # fija el contexto diario
     s_x = check_cross(sym, h1, st, ctx)
+    print(f"{label(sym)}: precio {px:.5g} | semanal OB: {s_ob} | diario RSI: {s_div} | horario cruce: {s_x}")
     for dirn, lo, hi, ts, mult in obs:
-        print(f"   {sym} OB {NAME[dirn]} semana {ts:%Y-%m-%d} zona {lo:.5g}–{hi:.5g} ({mult:.1f} ATR)")
-    if s_ob.startswith("dentro") or s_div != "sin divergencia" or s_x != "sin cruce":
-        print(f"{sym}: precio {px:.5g} | semanal OB: {s_ob} | diario RSI: {s_div} | horario cruce: {s_x}")
+        print(f"      OB {NAME[dirn]} semana {ts:%Y-%m-%d} zona {lo:.5g}–{hi:.5g} ({mult:.1f} ATR)")
 
 
 def scan(st):
