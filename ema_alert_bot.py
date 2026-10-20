@@ -1,47 +1,61 @@
 """
 Bot de alertas swing (Telegram). Solo avisa, no opera.
-  Diario : precio entrando en zona de Order Block grande
-  Horario: divergencia grande del RSI
-  5 min  : cruce de medias (EMA rápida/lenta)
-
-Modos:
-  python ema_alert_bot.py          -> loop continuo (PC/VPS/Raspberry), las 3 alertas
-  python ema_alert_bot.py --once   -> una pasada, solo diario + horario (GitHub Actions)
+  Semanal: precio entrando en zona de Order Block grande (sin tocar desde su formación)
+  Diario : divergencia grande del RSI
+  Horario: cruce de medias (EMA rápida/lenta), con confluencia
+Hace una pasada por ejecución (GitHub Actions lo corre cada hora). Datos: Yahoo Finance.
+  python ema_alert_bot.py         -> revisa todo y avisa
+  python ema_alert_bot.py --test  -> manda un mensaje de prueba a Telegram
 """
 import os, sys, json, time
+from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import pandas as pd
 import requests
 
-# ---------------- ACTIVOS ----------------
-WATCHLIST = [
-    # ("crypto", símbolo en Kraken)  /  ("yf", ticker de Yahoo Finance)
-    ("crypto", "BTC/USD"),
-    ("crypto", "ETH/USD"),
-    ("yf", "TSLA"),
-    ("yf", "NVDA"),
-    ("yf", "COIN"),
-    ("yf", "MSTR"),
-    ("yf", "EURUSD=X"),
-    ("yf", "USDJPY=X"),
-]
+# ---------------- ACTIVOS (tickers de Yahoo Finance) ----------------
+FOREX = [f"{p}=X" for p in (
+    "EURUSD GBPUSD USDJPY USDCHF AUDUSD USDCAD NZDUSD "
+    "EURGBP EURJPY EURCHF EURAUD EURCAD EURNZD GBPJPY GBPCHF GBPAUD GBPCAD GBPNZD "
+    "AUDJPY AUDCAD AUDCHF AUDNZD CADJPY CADCHF CHFJPY NZDJPY NZDCAD NZDCHF "
+    "USDMXN USDZAR USDTRY USDSEK USDNOK USDDKK USDSGD USDHKD USDPLN USDCNH").split()]
+INDICES = ["^GSPC", "^NDX", "^DJI", "^RUT", "^FTSE", "^GDAXI", "^FCHI", "^STOXX50E",
+           "^N225", "^HSI", "^AXJO", "^IBEX", "^AEX", "^SSMI"]
+COMMODITIES = ["GC=F", "SI=F", "HG=F", "PL=F", "PA=F", "CL=F", "BZ=F", "NG=F",
+               "KC=F", "SB=F", "CC=F", "ZC=F", "ZW=F", "ZS=F"]
+CRYPTO = ["BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD", "ADA-USD", "DOGE-USD", "LTC-USD",
+          "BNB-USD", "AVAX-USD", "LINK-USD", "DOT-USD", "BCH-USD"]
+STOCKS = ("AAPL MSFT AMZN GOOGL META NVDA TSLA AMD NFLX INTC AVGO ORCL CRM ADBE QCOM MU PLTR COIN MSTR "
+          "UBER SHOP PYPL HOOD ARM TSM BABA NIO RIVN BA DIS JPM BAC GS V MA WMT KO PEP XOM CVX PFE "
+          "JNJ NKE MCD SBUX F GM").split()
+WATCHLIST = FOREX + INDICES + COMMODITIES + CRYPTO + STOCKS
+# (para quitar un activo, borralo de la lista de arriba; para sumar, agregá su ticker de Yahoo)
+
+NAMES = {"^GSPC": "S&P 500", "^NDX": "Nasdaq 100", "^DJI": "Dow Jones", "^RUT": "Russell 2000",
+         "^FTSE": "FTSE 100", "^GDAXI": "DAX", "^FCHI": "CAC 40", "^STOXX50E": "Euro Stoxx 50",
+         "^N225": "Nikkei 225", "^HSI": "Hang Seng", "^AXJO": "ASX 200", "^IBEX": "IBEX 35",
+         "^AEX": "AEX", "^SSMI": "SMI", "GC=F": "Oro", "SI=F": "Plata", "HG=F": "Cobre",
+         "PL=F": "Platino", "PA=F": "Paladio", "CL=F": "WTI", "BZ=F": "Brent", "NG=F": "Gas natural"}
 
 # ---------------- PARÁMETROS ----------------
-# Order block diario
-OB_LOOKBACK = 120        # velas diarias hacia atrás
+# SEMANAL: order block
+OB_LOOKBACK = 90         # velas semanales hacia atrás
 OB_IMPULSE_ATR = 3.0     # "grande": el impulso posterior mueve >= 3 ATR
 OB_IMPULSE_CANDLES = 5   # ...dentro de 5 velas
-# Divergencia RSI horaria
+OB_ZONE = "body"         # "body" = cuerpo de la vela / "range" = rango completo con mechas
+OB_ONLY_FRESH = True     # solo OB que el precio NO volvió a tocar desde que se formó
+NEAR_PCT = 0.03          # el log lista los OB a menos de 3% del precio
+# DIARIO: divergencia RSI
 RSI_LEN = 14
-PIVOT_N = 5              # un pivote se confirma con 5 velas a cada lado (5 h de demora)
+PIVOT_N = 3              # un pivote se confirma con 3 velas a cada lado (3 días de demora)
 DIV_LOOKBACK = 120
-DIV_MIN_GAP = 12         # velas mínimas entre los dos pivotes
+DIV_MIN_GAP = 10         # velas mínimas entre los dos pivotes
 DIV_MIN_RSI_DIFF = 5     # diferencia mínima de RSI entre pivotes
 DIV_MIN_PRICE_ATR = 0.5  # el precio debe superar el pivote anterior por >= 0.5 ATR
-# Cruce 5 min
+# HORARIO: cruce de medias
 FAST, SLOW = 5, 10
-GATE_5M = True           # True: solo avisa el cruce si coincide con OB diario o divergencia 1H
-GATE_DIV_HOURS = 24      # cuánto tiempo vale una divergencia como contexto
+GATE_1H = True           # True: avisa el cruce solo si coincide con OB semanal o divergencia diaria
+GATE_DIV_HOURS = 72      # cuánto vale una divergencia diaria como contexto
 
 STATE_FILE = "alert_state.json"
 TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -49,32 +63,59 @@ CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 # --------------------------------------------
 
 NAME = {"bull": "ALCISTA", "bear": "BAJISTA"}
-DELTA = {"5m": pd.Timedelta(minutes=5), "1h": pd.Timedelta(hours=1), "1d": pd.Timedelta(days=1)}
-YF_PERIOD = {"5m": "5d", "1h": "60d", "1d": "1y"}
-OB_CACHE = {}
-_kraken = None
+DELTA = {"1h": pd.Timedelta(hours=1), "1d": pd.Timedelta(days=1), "1w": pd.Timedelta(days=7)}
+YF_PERIOD = {"1h": "60d", "1d": "5y"}
+SEND_FAILED = False
+NEAR = []
 
 
-def candles(kind, sym, tf):
-    global _kraken
-    if kind == "crypto":
-        if _kraken is None:
-            import ccxt
-            _kraken = ccxt.kraken()
-        raw = _kraken.fetch_ohlcv(sym, tf, limit=720)
-        df = pd.DataFrame(raw, columns=["t", "open", "high", "low", "close", "vol"])
-        df.index = pd.to_datetime(df["t"], unit="ms", utc=True)
-    else:
-        import yfinance as yf
-        df = yf.download(sym, period=YF_PERIOD[tf], interval=tf, progress=False, auto_adjust=True)
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        df.columns = [c.lower() for c in df.columns]
-        df = df.dropna()
-        if df.index.tz is None:
-            df.index = df.index.tz_localize("UTC")
-    now = pd.Timestamp.now(tz="UTC")
-    return df[df.index + DELTA[tf] <= now]  # solo velas cerradas
+def label(sym):
+    return NAMES.get(sym) and f"{NAMES[sym]} ({sym})" or sym.replace("=X", "")
+
+
+def send(msg):
+    global SEND_FAILED
+    try:
+        r = requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+                          json={"chat_id": CHAT_ID, "text": msg}, timeout=15)
+        if r.ok:
+            return True
+        print(f"ERROR Telegram {r.status_code}: {r.text}")
+    except Exception as e:
+        print("ERROR Telegram:", str(e).replace(TOKEN or "", "***"))
+    SEND_FAILED = True
+    return False
+
+
+def fetch_one(sym, tf):
+    """Velas cerradas de un activo (None si Yahoo no responde)."""
+    import yfinance as yf
+    for attempt in range(2):
+        try:
+            df = yf.Ticker(sym).history(period=YF_PERIOD[tf], interval=tf, auto_adjust=True)
+            if df is not None and len(df):
+                df.columns = [c.lower() for c in df.columns]
+                df = df[["open", "high", "low", "close"]].dropna()
+                if df.index.tz is None:
+                    df.index = df.index.tz_localize("UTC")
+                return df[df.index + DELTA[tf] <= pd.Timestamp.now(tz="UTC")]
+        except Exception:
+            pass
+        time.sleep(1.5)
+    return None
+
+
+def fetch_all(tickers, tf):
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        res = list(ex.map(lambda t: fetch_one(t, tf), tickers))
+    return dict(zip(tickers, res))
+
+
+def to_weekly(d):
+    """Velas semanales (lunes a domingo) a partir de las diarias."""
+    w = d.resample("W-MON", label="left", closed="left").agg(
+        {"open": "first", "high": "max", "low": "min", "close": "last"}).dropna()
+    return w[w.index + DELTA["1w"] <= pd.Timestamp.now(tz="UTC")]
 
 
 def atr(df, n=14):
@@ -101,10 +142,11 @@ def pivots(x, n, kind):
     return out
 
 
-# ---------- DIARIO: order blocks ----------
+# ---------- SEMANAL: order blocks ----------
 def find_obs(df):
     """OB alcista: última vela bajista antes de un impulso alcista grande (espejo para bajista).
-    Vigente mientras ningún cierre posterior la atraviese."""
+    Se descarta si un cierre posterior lo atraviesa o (OB_ONLY_FRESH) si el precio ya volvió a tocarlo.
+    Devuelve (dirección, zona_baja, zona_alta, semana, impulso_en_ATR)."""
     d = df.iloc[-OB_LOOKBACK:]
     a = atr(d).values
     o, h, l, c = (d[k].values for k in ("open", "high", "low", "close"))
@@ -115,31 +157,58 @@ def find_obs(df):
             continue
         end = min(i + 1 + OB_IMPULSE_CANDLES, n)
         if c[i] < o[i] and c[i + 1] > o[i + 1]:
-            if h[i + 1:end].max() - c[i] >= OB_IMPULSE_ATR * a[i] and not (c[i + 1:] < l[i]).any():
-                obs.append(("bull", l[i], h[i], d.index[i]))
+            dirn, move = "bull", h[i + 1:end].max() - c[i]
         elif c[i] > o[i] and c[i + 1] < o[i + 1]:
-            if c[i] - l[i + 1:end].min() >= OB_IMPULSE_ATR * a[i] and not (c[i + 1:] > h[i]).any():
-                obs.append(("bear", l[i], h[i], d.index[i]))
+            dirn, move = "bear", c[i] - l[i + 1:end].min()
+        else:
+            continue
+        if move < OB_IMPULSE_ATR * a[i]:
+            continue
+        lo, hi = (min(o[i], c[i]), max(o[i], c[i])) if OB_ZONE == "body" else (l[i], h[i])
+        if dirn == "bull":
+            if (c[i + 1:] < l[i]).any():
+                continue
+            if OB_ONLY_FRESH and (l[i + 2:] <= hi).any():
+                continue
+        else:
+            if (c[i + 1:] > h[i]).any():
+                continue
+            if OB_ONLY_FRESH and (h[i + 2:] >= lo).any():
+                continue
+        obs.append((dirn, lo, hi, d.index[i], move / a[i]))
     return obs
 
 
 def check_ob(sym, px, obs, st, ctx):
-    prev = st["ob"].get(sym, {})
-    new = {}
+    sent = st["ob_sent"].setdefault(sym, [])
     ctx["ob"] = None
-    for dirn, lo, hi, ts in obs:
+    status = f"fuera de zona ({len(obs)} OB vigentes)"
+    for dirn, lo, hi, ts, mult in obs:
+        inside = lo <= px <= hi
+        dist = 0.0 if inside else min(abs(px - lo), abs(px - hi)) / px
+        if dist <= NEAR_PCT:
+            NEAR.append((sym, dirn, dist))
+        if not inside:
+            continue
+        ctx["ob"] = dirn
         oid = f"{dirn}|{ts:%Y-%m-%d}"
-        inside = bool(lo <= px <= hi)
-        new[oid] = inside
-        if inside:
-            ctx["ob"] = dirn
-            if not prev.get(oid, False):  # solo al ENTRAR a la zona
-                send(f"{sym} · DIARIO\nPrecio dentro de OB {NAME[dirn]} grande\n"
-                     f"Zona: {lo:.5g} – {hi:.5g}\nFormado: {ts:%Y-%m-%d}\nPrecio: {px:.5g}")
-    st["ob"][sym] = new
+        status = f"dentro de OB {NAME[dirn]}"
+        if oid in sent:
+            status += " (ya avisado)"
+            continue
+        zona = "cuerpo de la vela" if OB_ZONE == "body" else "rango completo"
+        ok = send(f"{label(sym)} · SEMANAL\nPrecio dentro de OB {NAME[dirn]} grande (sin tocar desde su formación)\n"
+                  f"Zona ({zona}): {lo:.5g} – {hi:.5g}\nVela del OB: semana del {ts:%Y-%m-%d}\n"
+                  f"Impulso posterior: {mult:.1f} ATR\nPrecio: {px:.5g}")
+        if ok:
+            sent.append(oid)
+            status += " (alerta enviada)"
+        else:
+            status += " (envío FALLÓ)"
+    return status
 
 
-# ---------- HORARIO: divergencia RSI ----------
+# ---------- DIARIO: divergencia RSI ----------
 def find_divergence(df):
     r = rsi(df.close).iloc[-DIV_LOOKBACK:].values
     d = df.iloc[-DIV_LOOKBACK:]
@@ -164,23 +233,25 @@ def find_divergence(df):
     return None
 
 
-def check_div(sym, h1, st, ctx):
-    res = find_divergence(h1)
+def check_div(sym, d1, st, ctx):
+    res = find_divergence(d1)
     if not res:
-        return
+        return "sin divergencia"
     dirn, ts, r1, r2, p1, p2 = res
     ctx["div"] = {"dir": dirn, "seen": pd.Timestamp.now(tz="UTC").isoformat()}
     key = f"{dirn}|{ts}"
-    if st["last"].get(f"{sym}|1h") == key:
-        return
-    st["last"][f"{sym}|1h"] = key
-    send(f"{sym} · HORARIO\nDivergencia {NAME[dirn]} grande en RSI\n"
-         f"Precio: {p1:.5g} → {p2:.5g}\nRSI: {r1:.1f} → {r2:.1f}\nPivote: {ts:%Y-%m-%d %H:%M} UTC")
+    if st["last"].get(f"{sym}|1d") == key:
+        return f"{NAME[dirn]} (ya avisada)"
+    ok = send(f"{label(sym)} · DIARIO\nDivergencia {NAME[dirn]} grande en RSI\n"
+              f"Precio: {p1:.5g} → {p2:.5g}\nRSI: {r1:.1f} → {r2:.1f}\nPivote: {ts:%Y-%m-%d}")
+    if ok:
+        st["last"][f"{sym}|1d"] = key
+    return f"{NAME[dirn]} (alerta {'enviada' if ok else 'FALLÓ'})"
 
 
-# ---------- 5 MIN: cruce de medias ----------
-def check_cross(sym, d5, st, ctx):
-    c = d5.close
+# ---------- HORARIO: cruce de medias ----------
+def check_cross(sym, h1, st, ctx):
+    c = h1.close
     gap = c.ewm(span=FAST, adjust=False).mean() - c.ewm(span=SLOW, adjust=False).mean()
     g0, g1 = gap.iloc[-2], gap.iloc[-1]
     if g0 <= 0 < g1:
@@ -188,50 +259,62 @@ def check_cross(sym, d5, st, ctx):
     elif g0 >= 0 > g1:
         dirn = "bear"
     else:
-        return
-    ts = d5.index[-1]
+        return "sin cruce"
+    ts = h1.index[-1]
     key = f"{dirn}|{ts}"
-    if st["last"].get(f"{sym}|5m") == key:
-        return
-    st["last"][f"{sym}|5m"] = key
+    if st["last"].get(f"{sym}|1h") == key:
+        return f"cruce {NAME[dirn]} (ya avisado)"
     why = []
     if ctx.get("ob") == dirn:
-        why.append("precio en OB diario " + NAME[dirn].lower())
+        why.append("precio en OB semanal " + NAME[dirn].lower())
     div = ctx.get("div")
     if div and div["dir"] == dirn and \
             pd.Timestamp.now(tz="UTC") - pd.Timestamp(div["seen"]) <= pd.Timedelta(hours=GATE_DIV_HOURS):
-        why.append("divergencia RSI 1H " + NAME[dirn].lower())
-    if GATE_5M and not why:
-        return
-    send(f"{sym} · 5 MIN\nCruce {NAME[dirn]} EMA{FAST}/EMA{SLOW}\nPrecio: {c.iloc[-1]:.5g}\n"
-         f"Contexto: {', '.join(why) if why else 'sin confluencia'}\nVela: {ts:%Y-%m-%d %H:%M} UTC")
+        why.append("divergencia RSI diaria " + NAME[dirn].lower())
+    if GATE_1H and not why:
+        st["last"][f"{sym}|1h"] = key
+        return f"cruce {NAME[dirn]} sin confluencia (no se avisa)"
+    ok = send(f"{label(sym)} · HORARIO\nCruce {NAME[dirn]} EMA{FAST}/EMA{SLOW}\nPrecio: {c.iloc[-1]:.5g}\n"
+              f"Contexto: {', '.join(why) if why else 'sin confluencia'}\nVela: {ts:%Y-%m-%d %H:%M} UTC")
+    if ok:
+        st["last"][f"{sym}|1h"] = key
+    return f"cruce {NAME[dirn]} (alerta {'enviada' if ok else 'FALLÓ'})"
 
 
-def send(msg):
-    if not TOKEN or not CHAT_ID:
-        print("[sin Telegram configurado]\n" + msg + "\n")
-        return
-    requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-                  json={"chat_id": CHAT_ID, "text": msg}, timeout=15)
-
-
-def run_symbol(kind, sym, st, do_5m, do_hourly):
+def run_symbol(sym, st, h1, d1):
     ctx = st["ctx"].setdefault(sym, {})
-    d5 = h1 = None
-    px = None
-    if do_5m:
-        d5 = candles(kind, sym, "5m")
-        px = float(d5.close.iloc[-1])
-    if do_hourly:
-        h1 = candles(kind, sym, "1h")
-        if px is None:
-            px = float(h1.close.iloc[-1])
-        check_div(sym, h1, st, ctx)
-    if do_hourly or sym not in OB_CACHE:
-        OB_CACHE[sym] = find_obs(candles(kind, sym, "1d"))
-    check_ob(sym, px, OB_CACHE[sym], st, ctx)
-    if do_5m:
-        check_cross(sym, d5, st, ctx)
+    px = float(h1.close.iloc[-1])
+    obs = find_obs(to_weekly(d1))
+    s_ob = check_ob(sym, px, obs, st, ctx)   # fija el contexto semanal
+    s_div = check_div(sym, d1, st, ctx)      # fija el contexto diario
+    s_x = check_cross(sym, h1, st, ctx)
+    for dirn, lo, hi, ts, mult in obs:
+        print(f"   {sym} OB {NAME[dirn]} semana {ts:%Y-%m-%d} zona {lo:.5g}–{hi:.5g} ({mult:.1f} ATR)")
+    if s_ob.startswith("dentro") or s_div != "sin divergencia" or s_x != "sin cruce":
+        print(f"{sym}: precio {px:.5g} | semanal OB: {s_ob} | diario RSI: {s_div} | horario cruce: {s_x}")
+
+
+def scan(st):
+    h1s = fetch_all(WATCHLIST, "1h")
+    d1s = fetch_all(WATCHLIST, "1d")
+    ok, nodata = 0, []
+    for sym in WATCHLIST:
+        h1, d1 = h1s.get(sym), d1s.get(sym)
+        if h1 is None or d1 is None or len(h1) < 30 or len(d1) < 120:
+            nodata.append(sym)
+            continue
+        try:
+            run_symbol(sym, st, h1, d1)
+            ok += 1
+        except Exception as e:
+            print(f"Error con {sym}: {e}")
+            nodata.append(sym)
+    print(f"\nRevisados {ok}/{len(WATCHLIST)} activos.")
+    if nodata:
+        print("Sin datos suficientes:", ", ".join(nodata))
+    if NEAR:
+        print(f"Cerca de un OB (<= {NEAR_PCT*100:.0f}%):",
+              "; ".join(f"{label(s)} OB {NAME[d]} a {x*100:.1f}%" for s, d, x in sorted(NEAR, key=lambda t: t[2])))
 
 
 def load_state():
@@ -239,35 +322,25 @@ def load_state():
         st = json.load(open(STATE_FILE))
     except Exception:
         st = {}
-    for k in ("last", "ob", "ctx"):
-        st.setdefault(k, {})
+    for k in ("last", "ob_sent", "ctx"):
+        if not isinstance(st.get(k), dict):
+            st[k] = {}
     return st
 
 
 def main():
-    once = "--once" in sys.argv
+    if not TOKEN or not CHAT_ID:
+        print("ERROR: faltan los secretos TELEGRAM_TOKEN y/o TELEGRAM_CHAT_ID "
+              "(Settings > Secrets and variables > Actions)")
+        sys.exit(1)
+    if "--test" in sys.argv:
+        ok = send("✅ Bot de alertas funcionando. Si ves este mensaje, Telegram está bien configurado.")
+        print("Mensaje de prueba enviado." if ok else "FALLÓ el mensaje de prueba.")
+        sys.exit(0 if ok else 1)
     st = load_state()
-    if once:
-        for kind, sym in WATCHLIST:
-            try:
-                run_symbol(kind, sym, st, do_5m=False, do_hourly=True)
-            except Exception as e:
-                print(f"Error con {sym}: {e}")
-        json.dump(st, open(STATE_FILE, "w"))
-        return
-    first = True
-    while True:
-        now = pd.Timestamp.now(tz="UTC")
-        hourly = first or now.minute < 5
-        first = False
-        for kind, sym in WATCHLIST:
-            try:
-                run_symbol(kind, sym, st, do_5m=True, do_hourly=hourly)
-            except Exception as e:
-                print(f"Error con {sym}: {e}")
-        json.dump(st, open(STATE_FILE, "w"))
-        nxt = now.floor("5min") + pd.Timedelta(minutes=5, seconds=20)
-        time.sleep(max(5, (nxt - pd.Timestamp.now(tz="UTC")).total_seconds()))
+    scan(st)
+    json.dump(st, open(STATE_FILE, "w"))
+    sys.exit(1 if SEND_FAILED else 0)
 
 
 if __name__ == "__main__":
